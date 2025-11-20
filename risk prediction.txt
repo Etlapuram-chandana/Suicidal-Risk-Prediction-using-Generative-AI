@@ -1,0 +1,132 @@
+import streamlit as st
+import PyPDF2
+import re
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+
+# ----------------- Setup -----------------
+load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+st.set_page_config(page_title="Mental Health Risk Predictor", layout="centered")
+st.title("🧠 Suicide Risk Predictor (PDF + Gemini + Questionnaire)")
+
+# ----------------- Embedded Questions -----------------
+questions = [
+    "Do you often feel hopeless or down?",
+    "Do you have trouble sleeping or experience nightmares?",
+    "Have you had thoughts of self-harm or suicide recently?",
+    "Do you feel isolated or withdrawn from others?",
+    "Do you experience sudden mood swings or aggression?",
+    "Are you currently taking any medications for mental health?",
+    "Do you feel anxious or panicked regularly?"
+]
+
+# ----------------- Helper Functions -----------------
+
+def extract_text_from_pdf(uploaded_file):
+    reader = PyPDF2.PdfReader(uploaded_file)
+    return " ".join([page.extract_text() for page in reader.pages])
+
+def clean_text(text):
+    return re.sub(r'\s+', ' ', text.strip())
+
+def extract_counselor_section(text):
+    match = re.search(r'--- COUNSELOR REPORT ---(.+)', text, re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+def get_gemini_risk_score(text):
+    prompt = f"""
+    Analyze this counselor note and return a risk score (0–3):
+    - 0 = No signs of suicidal thoughts
+    - 1 = Mild distress
+    - 2 = Concerning signs
+    - 3 = Suicidal ideation
+
+    Counselor Notes: \"\"\"{text}\"\"\"
+    ONLY return the number.
+    """
+    model = genai.GenerativeModel(model_name="gemini-pro")
+    try:
+        response = model.generate_content(prompt)
+        return min(3, max(0, int(response.text.strip())))
+    except:
+        return 1  # default fallback
+
+def evaluate_medical_section(text):
+    score = 0
+    if re.search(r'Blood Pressure:\s*(\d{2,3})/(\d{2,3})', text):
+        bp = re.search(r'Blood Pressure:\s*(\d{2,3})/(\d{2,3})', text)
+        if int(bp.group(1)) > 140 or int(bp.group(2)) > 90:
+            score += 1
+    if re.search(r'Cortisol Level:\s*(\d+)', text):
+        if int(re.search(r'Cortisol Level:\s*(\d+)', text).group(1)) > 20:
+            score += 1
+    if "Serotonin Level: Low" in text:
+        score += 1
+    if re.search(r'Heart Rate:\s*(\d+)', text):
+        if int(re.search(r'Heart Rate:\s*(\d+)', text).group(1)) > 100:
+            score += 1
+    return score
+
+def calculate_final_score(medical, counselor, questionnaire):
+    return (medical * 0.3 + counselor * 0.4 + questionnaire * 0.3) / 4 * 100
+
+# ----------------- Streamlit UI -----------------
+st.subheader("📄 Upload Combined Medical + Counselor Report (PDF)")
+uploaded_file = st.file_uploader("Upload Report", type=["pdf"])
+
+if uploaded_file:
+    raw_text = extract_text_from_pdf(uploaded_file)
+    cleaned_text = clean_text(raw_text)
+    counselor_text = extract_counselor_section(cleaned_text)
+
+    st.subheader("📊 Medical Report Scoring")
+    med_score = evaluate_medical_section(cleaned_text)
+    st.write(f"Medical Score: {med_score}/4")
+
+    st.subheader("🧠 Gemini Counselor Risk Analysis")
+    with st.spinner("Analyzing counselor notes..."):
+        counselor_score = get_gemini_risk_score(counselor_text)
+    st.write(f"Gemini Counselor Score: {counselor_score}/3")
+
+    st.subheader("📝 Mental Health Questionnaire")
+    auto_fill_no = (med_score <= 1 and counselor_score <= 1)
+    q_score = 0
+    for idx, q in enumerate(questions, 1):
+        default = "No" if auto_fill_no else None
+        ans = st.radio(q, ["Yes", "No"], key=idx, index=1 if default == "No" else 0)
+        if ans == "Yes":
+            q_score += 1
+    q_score = min(q_score, 4)
+    st.write(f"Questionnaire Score: {q_score}/4")
+
+    final_score = calculate_final_score(med_score, counselor_score, q_score)
+
+st.subheader("📊 Final Suicidal Risk Estimate")
+st.metric("Suicidal Risk", f"{final_score:.2f}%")
+
+if final_score >= 70:
+    st.markdown("""
+    <div style='background-color:#ffcccc;padding:10px;border-radius:10px;'>
+        <h4 style='color:#cc0000;'>🔴 <b>High Risk Detected</b></h4>
+        Immediate professional help is strongly recommended.<br>
+        <i>You are not alone — support is available.</i>
+    </div>
+    """, unsafe_allow_html=True)
+elif final_score >= 40:
+    st.markdown("""
+    <div style='background-color:#fff3cd;padding:10px;border-radius:10px;'>
+        <h4 style='color:#ff9900;'>🟠 <b>Moderate Risk Detected</b></h4>
+        Caution advised. Keep monitoring and talk to someone you trust.
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div style='background-color:#d4edda;padding:10px;border-radius:10px;'>
+        <h4 style='color:#2e7d32;'>🟢 <b>Low Risk Detected</b></h4>
+        You're doing well! Keep it up 💪
+    </div>
+    """, unsafe_allow_html=True)
+
